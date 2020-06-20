@@ -68,6 +68,7 @@ typedef struct {
     time_t                      error_log_time;
     ngx_syslog_peer_t          *syslog_peer;
     ngx_http_log_fmt_t         *format;
+    ngx_http_log_fmt_t         *preaccess_format; /* preaccess phase log format */
     ngx_http_complex_value_t   *filter;
 } ngx_http_log_t;
 
@@ -145,6 +146,9 @@ static size_t ngx_http_log_unescaped_variable_getlen(ngx_http_request_t *r,
     uintptr_t data);
 static u_char *ngx_http_log_unescaped_variable(ngx_http_request_t *r,
     u_char *buf, ngx_http_log_op_t *op);
+static ngx_int_t
+ngx_http_variable_preaccess_logged(ngx_http_request_t *r,
+    ngx_http_variable_value_t *v, uintptr_t data);
 
 
 static void *ngx_http_log_create_main_conf(ngx_conf_t *cf);
@@ -249,22 +253,45 @@ static ngx_http_log_var_t  ngx_http_log_vars[] = {
     { ngx_null_string, 0, NULL }
 };
 
+static ngx_int_t preaccess_logged_index = -1;
+static ngx_http_variable_t  ngx_http_log_variables[] = {
+    { ngx_string("preaccess_logged"), NULL, ngx_http_variable_preaccess_logged, 0, 0, 0 },
+    ngx_http_null_variable
+};
 
 static ngx_int_t
-ngx_http_log_handler(ngx_http_request_t *r)
+ngx_http_variable_preaccess_logged(ngx_http_request_t *r,
+    ngx_http_variable_value_t *v, uintptr_t data)
 {
+    u_char  *logged;
+
+    logged = ngx_palloc(r->pool, sizeof(u_char));
+    if (logged == NULL) {
+        return NGX_ERROR;
+    }
+
+    v->valid = 1;
+    v->no_cacheable = 0;
+    v->not_found = 0;
+
+    v->len = sizeof(u_char);
+    v->data = logged;
+    *logged = 0;
+    return NGX_OK;
+}
+
+static ngx_int_t
+ngx_http_log_handle(ngx_http_request_t *r, ngx_uint_t preaccess){
     u_char                   *line, *p;
     size_t                    len, size;
     ssize_t                   n;
     ngx_str_t                 val;
     ngx_uint_t                i, l;
     ngx_http_log_t           *log;
+    ngx_http_log_fmt_t       *format;
     ngx_http_log_op_t        *op;
     ngx_http_log_buf_t       *buffer;
     ngx_http_log_loc_conf_t  *lcf;
-
-    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                   "http log handler");
 
     lcf = ngx_http_get_module_loc_conf(r, ngx_http_log_module);
 
@@ -274,6 +301,15 @@ ngx_http_log_handler(ngx_http_request_t *r)
 
     log = lcf->logs->elts;
     for (l = 0; l < lcf->logs->nelts; l++) {
+        if (preaccess) {
+            if (log[l].preaccess_format == NULL) {
+                continue;
+            } else {
+                format = log[l].preaccess_format;
+            }
+        } else {
+            format = log[l].format;
+        }
 
         if (log[l].filter) {
             if (ngx_http_complex_value(r, log[l].filter, &val) != NGX_OK) {
@@ -296,11 +332,11 @@ ngx_http_log_handler(ngx_http_request_t *r)
             continue;
         }
 
-        ngx_http_script_flush_no_cacheable_variables(r, log[l].format->flushes);
+        ngx_http_script_flush_no_cacheable_variables(r, format->flushes);
 
         len = 0;
-        op = log[l].format->ops->elts;
-        for (i = 0; i < log[l].format->ops->nelts; i++) {
+        op = format->ops->elts;
+        for (i = 0; i < format->ops->nelts; i++) {
             if (op[i].len == 0) {
                 len += op[i].getlen(r, op[i].data);
 
@@ -341,7 +377,7 @@ ngx_http_log_handler(ngx_http_request_t *r)
                     ngx_add_timer(buffer->event, buffer->flush);
                 }
 
-                for (i = 0; i < log[l].format->ops->nelts; i++) {
+                for (i = 0; i < format->ops->nelts; i++) {
                     p = op[i].run(r, p, &op[i]);
                 }
 
@@ -370,7 +406,7 @@ ngx_http_log_handler(ngx_http_request_t *r)
             p = ngx_syslog_add_header(log[l].syslog_peer, line);
         }
 
-        for (i = 0; i < log[l].format->ops->nelts; i++) {
+        for (i = 0; i < format->ops->nelts; i++) {
             p = op[i].run(r, p, &op[i]);
         }
 
@@ -400,6 +436,41 @@ ngx_http_log_handler(ngx_http_request_t *r)
 
     return NGX_OK;
 }
+
+
+static ngx_int_t
+ngx_http_log_preaccess_handler(ngx_http_request_t *r)
+{
+    ngx_int_t                  rc;
+    u_char                     *logged;
+    ngx_http_variable_value_t  *logged_var;
+
+    logged_var = ngx_http_get_indexed_variable(r, preaccess_logged_index);
+    if (logged_var == NULL || logged_var->not_found) {
+        return NGX_OK;
+    }
+    logged = logged_var->data != NULL ? (u_char*)logged_var->data : NULL;
+    if (logged == NULL || *logged) {
+        return NGX_OK;
+    }
+
+    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                   "http log preaccess handler");
+
+
+    rc = ngx_http_log_handle(r, 1);
+    *logged = 1;
+    return rc;  
+}
+
+
+static ngx_int_t
+ngx_http_log_handler(ngx_http_request_t *r)
+{
+    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                   "http log handler");
+    return ngx_http_log_handle(r, 0);
+} 
 
 
 static void
@@ -1241,7 +1312,7 @@ ngx_http_log_set_log(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 
     ssize_t                            size;
     ngx_int_t                          gzip;
-    ngx_uint_t                         i, n;
+    ngx_uint_t                         i, j, n;
     ngx_msec_t                         flush;
     ngx_str_t                         *value, name, s;
     ngx_http_log_t                    *log;
@@ -1366,6 +1437,29 @@ process_formats:
     gzip = 0;
 
     for (i = 3; i < cf->args->nelts; i++) {
+
+        if (ngx_strncmp(value[i].data, "preaccess_format=", 17) == 0) {
+            s.len = value[i].len - 17;
+            s.data = value[i].data + 17;
+
+            fmt = lmcf->formats.elts;
+            for (j = 0; j < lmcf->formats.nelts; j++) {
+                if (fmt[j].name.len == s.len
+                    && ngx_strcasecmp(fmt[j].name.data, s.data) == 0)
+                {
+                    log->preaccess_format = &fmt[j];
+                    break;
+                }
+            }
+
+            if (log->preaccess_format == NULL) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "unknown log format \"%V\"", &s);
+                return NGX_CONF_ERROR;
+            }
+
+            continue;
+        }
 
         if (ngx_strncmp(value[i].data, "buffer=", 7) == 0) {
             s.len = value[i].len - 7;
@@ -1873,6 +1967,8 @@ ngx_http_log_init(ngx_conf_t *cf)
     ngx_http_log_fmt_t         *fmt;
     ngx_http_log_main_conf_t   *lmcf;
     ngx_http_core_main_conf_t  *cmcf;
+    ngx_http_variable_t        *lv, *v;
+    ngx_str_t                   name = ngx_string("preaccess_logged");
 
     lmcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_log_module);
 
@@ -1896,7 +1992,27 @@ ngx_http_log_init(ngx_conf_t *cf)
         }
     }
 
+    for (lv = ngx_http_log_variables; lv->name.len; lv++) {
+        v = ngx_http_add_variable(cf, &lv->name, lv->flags);
+        if (v == NULL) {
+            return NGX_ERROR;
+        }
+
+        *v = *lv;
+    }
+    preaccess_logged_index = ngx_http_get_variable_index(cf, &name);
+    if (preaccess_logged_index == NGX_ERROR) {
+        return NGX_ERROR;
+    }
+
     cmcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_core_module);
+
+    h = ngx_array_push(&cmcf->phases[NGX_HTTP_PREACCESS_PHASE].handlers);
+    if (h == NULL) {
+        return NGX_ERROR;
+    }
+
+    *h = ngx_http_log_preaccess_handler;
 
     h = ngx_array_push(&cmcf->phases[NGX_HTTP_LOG_PHASE].handlers);
     if (h == NULL) {
@@ -1904,6 +2020,5 @@ ngx_http_log_init(ngx_conf_t *cf)
     }
 
     *h = ngx_http_log_handler;
-
     return NGX_OK;
 }
